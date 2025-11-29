@@ -1,22 +1,29 @@
+#Visión por computador
 import cv2
-import numpy as np
 import dlib
+#Procesamiento numérico
+import numpy as np
+#Utilidades
 import threading
 import time
 import os
+from datetime import datetime
+#Procesamiento de señales
 from scipy.signal import butter, filtfilt, detrend
 from scipy.fft import fft, fftfreq
 from scipy.linalg import eigh
+#Visualización
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+#Interfaz gráfica
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
-from datetime import datetime
+
 
 # Constantes configurables
-TIEMPO_MAX_GRABACION = 8  # segundos
+TIEMPO_MAX_GRABACION = 25  # segundos
 ANCHO_VIDEO = 640
 ALTO_VIDEO = 480
 FPS = 30.0
@@ -35,11 +42,13 @@ dibujar_recuadro_verde = False
 dibujar_puntos = False
 stop_threads = False
 
+#Inicializa los modelos de detección facial de la biblioteca Dlib, 68 puntos de referencia facial.
 def dibujar_puntos_faciales(frame, shape):
     for i in range(68):
         x, y = shape.part(i).x, shape.part(i).y
         cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
+#Extrae la región de interés (ROI)
 def crop_forehead(frame, face):
     left_eyebrow_x = face.left() + (face.right() - face.left()) // 3
     right_eyebrow_x = face.right() - (face.right() - face.left()) // 3
@@ -56,120 +65,43 @@ def crop_forehead(frame, face):
     roi_height = min(roi_height, frame.shape[0] - roi_y)
     return frame[roi_y:roi_y + roi_height, roi_x:roi_x + roi_width]
 
+
 def calcular_promedio_rgb(frame):
+    """
+    Calcula el valor promedio de cada canal de color en la ROI.
+    Recibe el recorte de la frente extraído por crop_forehead. 
+    Promedia todos los píxeles en ambas dimensiones espaciales 
+    (filas y columnas), obteniendo un único valor por canal.
+    Retorna un arreglo de tres elementos [R, G, B] que representa 
+    la intensidad media de la piel en ese instante, dato fundamental 
+    para construir la señal temporal de pulso.
+    """
     return np.mean(frame, axis=(0, 1))
 
 def butter_bandpass(lowcut, highcut, fs, order=5):
+    """
+    Diseña los coeficientes del filtro pasa-banda Butterworth. Recibe las 
+    frecuencias de corte inferior y superior en Hz, la frecuencia de muestreo y el orden del 
+    filtro. Normaliza las frecuencias respecto a Nyquist y genera los coeficientes b y a del 
+    filtro. Retorna la tupla (b, a) que define el filtro digital.
+    """
     nyquist = 0.5 * fs
     low = lowcut / nyquist
     high = highcut / nyquist
     b, a = butter(order, [low, high], btype='band')
     return b, a
 
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=6):
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=6): 
+    """
+    Aplica el filtro pasa-banda a una señal. Recibe la señal a filtrar, frecuencias de corte, 
+    frecuencia de muestreo y orden. Llama internamente a butter_bandpass para 
+    obtener los coeficientes y aplica filtrado bidireccional con filtfilt para evitar desfase. 
+    Retorna la señal filtrada, eliminando componentes fuera del rango cardíaco típico 
+    (0.8-2.33 Hz equivale a 48-140 BPM).
+    """
     b, a = butter_bandpass(lowcut, highcut, fs, order=order)
     return filtfilt(b, a, data, axis=0)
 
-def analisis_fase_compleja(senal, fps):
-    """
-    Implementa el método de fase compleja con transformada de Hilbert para estimar
-    la frecuencia cardíaca basada en la fase instantánea de la señal.
-    
-    Args:
-        senal: Array NumPy con la señal de pulsación filtrada
-        fps: Frecuencia de muestreo en Hz
-    
-    Returns:
-        Tupla con (frecuencia cardíaca en BPM, métricas adicionales)
-    """
-    from scipy.signal import hilbert
-    import numpy as np
-    
-    # Validación de entrada
-    if len(senal) < fps * 2:
-        print("Advertencia: Señal demasiado corta para análisis de fase compleja.")
-        return None, None
-    
-    try:
-        # 1. Crear señal analítica usando transformada de Hilbert
-        senal_analitica = hilbert(senal)
-        
-        # 2. Extraer fase instantánea y desenrollarla para evitar saltos
-        fase_instantanea = np.unwrap(np.angle(senal_analitica))
-        
-        # 3. Calcular frecuencia instantánea (derivada de la fase)
-        frecuencia_instantanea = np.zeros_like(fase_instantanea)
-        frecuencia_instantanea[1:-1] = (fase_instantanea[2:] - fase_instantanea[:-2]) / (2 * (1/fps))
-        frecuencia_instantanea[0] = frecuencia_instantanea[1]  # Extender primer valor
-        frecuencia_instantanea[-1] = frecuencia_instantanea[-2]  # Extender último valor
-        
-        # Convertir de rad/s a Hz
-        frecuencia_instantanea = frecuencia_instantanea / (2 * np.pi)
-        
-        # 4. Filtrar frecuencias instantáneas para eliminar valores atípicos
-        from scipy.signal import medfilt
-        frecuencia_suavizada = medfilt(frecuencia_instantanea, kernel_size=min(5, len(frecuencia_instantanea) // 10 * 2 + 1))
-        
-        # 5. Eliminar frecuencias fuera del rango fisiológico (48-180 BPM)
-        mask_fisiologica = (frecuencia_suavizada >= 0.8) & (frecuencia_suavizada <= 3.0)
-        frecuencias_validas = frecuencia_suavizada[mask_fisiologica]
-        
-        if len(frecuencias_validas) < fps // 2:  # Menos de medio segundo de datos válidos
-            print("Advertencia: Insuficientes datos válidos en análisis de fase.")
-            return None, None
-        
-        # 6. Calcular frecuencia cardíaca media usando mediana (más robusta)
-        fc_media = np.median(frecuencias_validas) * 60  # Convertir Hz a BPM
-        
-        # 7. Análisis de cruces por cero de la fase para detectar ciclos
-        fase_normalizada = np.mod(fase_instantanea + np.pi, 2 * np.pi) - np.pi
-        cruces = np.where((fase_normalizada[:-1] < 0) & (fase_normalizada[1:] >= 0))[0]
-        
-        # 8. Calcular intervalos entre cruces (en segundos)
-        fc_intervalos = None
-        if len(cruces) >= 2:
-            intervalos = np.diff(cruces) / fps
-            
-            # Filtrar intervalos atípicos usando IQR
-            q1 = np.percentile(intervalos, 25)
-            q3 = np.percentile(intervalos, 75)
-            iqr = q3 - q1
-            mask_intervalos = (intervalos >= q1 - 1.5*iqr) & (intervalos <= q3 + 1.5*iqr)
-            intervalos_validos = intervalos[mask_intervalos]
-            
-            if len(intervalos_validos) > 0:
-                fc_intervalos = 60 / np.median(intervalos_validos)
-        
-        # 9. Estimar confianza de la medición basada en estabilidad
-        if len(frecuencias_validas) > 0:
-            variabilidad = np.std(frecuencias_validas) / np.mean(frecuencias_validas)
-            confianza = max(0, min(1, 1 - variabilidad * 5))  # Mayor estabilidad = mayor confianza
-        else:
-            confianza = 0
-        
-        # 10. Resultado final (combinado o mejor método)
-        if fc_intervalos is not None and len(cruces) >= fps // 3:
-            # Si tenemos suficientes cruces por cero, priorizar ese método
-            peso_intervalos = 0.7
-            fc_final = fc_intervalos * peso_intervalos + fc_media * (1 - peso_intervalos)
-        else:
-            fc_final = fc_media
-        
-        # Validación final de resultados
-        if fc_final < 40 or fc_final > 200:
-            print(f"Advertencia: Frecuencia fuera de rango fisiológico: {fc_final} BPM")
-            return None, None
-            
-        return round(fc_final, 1), {
-            'fase': fase_instantanea,
-            'frecuencia_instantanea': frecuencia_suavizada,
-            'cruces': cruces,
-            'confianza': confianza
-        }
-        
-    except Exception as e:
-        print(f"Error en análisis de fase compleja: {e}")
-        return None, None
 
 # ============================================================================
 # CLASE BASE PARA MÉTODOS DE rPPG
@@ -190,8 +122,11 @@ class RPPGMethod:
         """
         raise NotImplementedError("Cada método debe implementar process()")
     
-    def calculate_snr(self, signal, freq_range=(0.7, 4.0)):
-        """Calcula el SNR de la señal en el rango de frecuencias cardíacas"""
+    def calculate_snr(self, signal, freq_range=(0.8, 2.33)):
+        """
+        Calcula la relación señal-ruido en el rango de frecuencias cardíacas, 
+        usado por la mayoría de los métodos para estimar confianza.
+        """
         # FFT de la señal
         n = len(signal)
         yf = fft(signal - np.mean(signal))
@@ -214,6 +149,7 @@ class RPPGMethod:
 
 # ============================================================================
 # MÉTODO VERDE + FFT (Original)
+# Implementa el método de extracción de pulso usando el canal verde y análisis FFT. 
 # ============================================================================
 class GreenFFTMethod(RPPGMethod):
     def __init__(self, fps=30.0):
@@ -238,7 +174,7 @@ class GreenFFTMethod(RPPGMethod):
         xf = fftfreq(n, 1/self.fps)
         
         # Buscar pico en rango válido
-        mask = (xf >= 0.7) & (xf <= 4.0)
+        mask = (xf >= 0.8) & (xf <= 2.33)
         idx = np.argmax(np.abs(yf[mask]))
         freq = xf[mask][idx]
         bpm = abs(freq * 60)
@@ -283,7 +219,7 @@ class PhaseMethod(RPPGMethod):
         instantaneous_frequency = np.diff(instantaneous_phase) / (2.0 * np.pi) * self.fps
         
         # Filtrar frecuencias válidas
-        valid_mask = (instantaneous_frequency >= 0.7) & (instantaneous_frequency <= 4.0)
+        valid_mask = (instantaneous_frequency >= 0.8) & (instantaneous_frequency <= 2.33)
         if np.sum(valid_mask) > 0:
             median_freq = np.median(instantaneous_frequency[valid_mask])
             bpm = median_freq * 60
@@ -344,7 +280,7 @@ class POSMethod(RPPGMethod):
         
         # Normalizar y filtrar
         P = (P - np.mean(P)) / np.std(P)
-        P_filtered = butter_bandpass_filter(P.reshape(-1, 1), 0.7, 4.0, self.fps).flatten()
+        P_filtered = butter_bandpass_filter(P.reshape(-1, 1), 0.8, 2.33, self.fps).flatten()
         
         # FFT para encontrar frecuencia
         n = len(P_filtered)
@@ -352,7 +288,7 @@ class POSMethod(RPPGMethod):
         xf = fftfreq(n, 1/self.fps)
         
         # Buscar pico
-        mask = (xf >= 0.7) & (xf <= 4.0)
+        mask = (xf >= 0.8) & (xf <= 2.33)
         idx = np.argmax(np.abs(yf[mask]))
         freq = xf[mask][idx]
         bpm = abs(freq * 60)
@@ -413,7 +349,7 @@ class CHROMMethod(RPPGMethod):
         
         # Normalizar y filtrar
         S = (S - np.mean(S)) / np.std(S)
-        S_filtered = butter_bandpass_filter(S.reshape(-1, 1), 0.7, 4.0, self.fps).flatten()
+        S_filtered = butter_bandpass_filter(S.reshape(-1, 1), 0.8, 2.33, self.fps).flatten()
         
         # FFT para encontrar frecuencia
         n = len(S_filtered)
@@ -421,7 +357,7 @@ class CHROMMethod(RPPGMethod):
         xf = fftfreq(n, 1/self.fps)
         
         # Buscar pico
-        mask = (xf >= 0.7) & (xf <= 4.0)
+        mask = (xf >= 0.8) & (xf <= 2.33)
         idx = np.argmax(np.abs(yf[mask]))
         freq = xf[mask][idx]
         bpm = abs(freq * 60)
@@ -488,7 +424,7 @@ class ICAMethod(RPPGMethod):
         for i in range(n_components):
             component = S[i, :]
             # Filtrar
-            filtered = butter_bandpass_filter(component.reshape(-1, 1), 0.7, 4.0, self.fps).flatten()
+            filtered = butter_bandpass_filter(component.reshape(-1, 1), 08, 2.33, self.fps).flatten()
             snr = self.calculate_snr(filtered)
             
             if snr > best_snr:
@@ -498,7 +434,7 @@ class ICAMethod(RPPGMethod):
         # Usar mejor componente
         pulse_signal = S[best_component, :]
         pulse_signal = (pulse_signal - np.mean(pulse_signal)) / np.std(pulse_signal)
-        pulse_filtered = butter_bandpass_filter(pulse_signal.reshape(-1, 1), 0.7, 4.0, self.fps).flatten()
+        pulse_filtered = butter_bandpass_filter(pulse_signal.reshape(-1, 1), 0.8, 2.33, self.fps).flatten()
         
         # FFT para encontrar frecuencia
         n = len(pulse_filtered)
@@ -506,7 +442,7 @@ class ICAMethod(RPPGMethod):
         xf = fftfreq(n, 1/self.fps)
         
         # Buscar pico
-        mask = (xf >= 0.7) & (xf <= 4.0)
+        mask = (xf >= 0.8) & (xf <= 2.33)
         idx = np.argmax(np.abs(yf[mask]))
         freq = xf[mask][idx]
         bpm = abs(freq * 60)
@@ -590,6 +526,11 @@ class MethodFusion:
         }
         
 class App:
+    """
+    Clase principal que orquesta todo el sistema. Gestiona la interfaz gráfica con Tkinter, 
+    la captura de video, el procesamiento en tiempo real y el almacenamiento de resultados.
+    """
+    
     def __init__(self, window, window_title):
         self.window = window
         self.window.title(window_title)
@@ -713,6 +654,10 @@ class App:
         print(f"[SISTEMA] Métodos inicializados: {list(self.methods.keys())}")
 
     def procesar_roi_buffer(self):
+        """
+        Gestiona el guardado asíncrono de fotogramas de la región de 
+        interés para evitar bloqueos en el bucle principal
+        """
         if len(self.roi_buffer) < self.min_roi_buffer:
             return
             
@@ -792,6 +737,12 @@ class App:
             self.window.update()
 
     def update(self):
+    """
+    Bucle principal del sistema. Captura frames de la cámara, detecta rostros, 
+    extrae la ROI de la frente y acumula los promedios RGB durante el tiempo de grabación. 
+    Al finalizar el ciclo, invoca "analizar_datos". Controla el timing para mantener el FPS 
+    objetivo y actualiza la interfaz gráfica.
+    """
         try:
             tiempo_actual_frame = time.time()
             tiempo_entre_updates = tiempo_actual_frame - self.ultimo_tiempo_frame
@@ -884,7 +835,14 @@ class App:
 
 
     def analizar_datos(self):
-        """Analiza los datos usando todos los métodos disponibles"""
+        """
+        Procesa los datos acumulados durante un ciclo de captura. 
+        Convierte las listas de promedios RGB y tiempos a arreglos NumPy, 
+        normaliza las señales, aplica filtro Kalman para suavizado, 
+        ejecuta los cinco métodos de análisis rPPG, fusiona los resultados 
+        ponderados por confianza, guarda resultados y genera gráficas. 
+        Al finalizar, reinicia las listas y se prepara para el siguiente ciclo.
+        """
         if len(self.promedios_rgb) == 0:
             print("[ERROR] No hay datos para analizar")
             return
@@ -1064,6 +1022,11 @@ class App:
             self.cerrar_aplicacion()
             
     def mostrar_resultados(self, resultados):
+    """
+    Muestra la frecuencia cardíaca calculada en la interfaz y en consola. 
+    Recibe el diccionario de resultados, formatea el texto con el número de ciclo y el BPM, 
+    actualiza la etiqueta de la interfaz y lo imprime en terminal.
+    """
         if resultados:
             texto = f"Ciclo {self.ciclo_actual} - Frecuencia cardíaca: {resultados['verde']} BPM"
         else:
@@ -1154,6 +1117,12 @@ class App:
         plt.close(fig)
 
     def crear_y_guardar_graficas(self, datos):
+    """
+    Guarda los resultados básicos de un ciclo en archivo de texto. 
+    Recibe el diccionario con los BPM por canal (rojo, verde, azul). 
+    Crea un archivo con timestamp en la carpeta del usuario, escribe los valores de cada canal 
+    y incluye datos del análisis de fase si existen.
+    """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         fig1 = plt.figure(figsize=(10, 6))
@@ -1437,14 +1406,20 @@ class App:
         print(f"[GRÁFICA] Guardada evolución multi-método en: {filename}")
 
     def toggle_recuadro(self):
+    #Bandera de visualización recuadro
         global dibujar_recuadro_verde
         dibujar_recuadro_verde = not dibujar_recuadro_verde
 
     def toggle_puntos(self):
+    #Bandera de visualización puntos
         global dibujar_puntos
         dibujar_puntos = not dibujar_puntos
 
     def cerrar_aplicacion(self):
+    """
+    Finaliza la aplicación de forma ordenada. Activa la bandera de cierre, 
+    detiene el análisis si está en curso, libera la cámara y destruye la ventana de Tkinter.
+    """
         self.is_closing = True
         if self.is_analyzing:
             self.detener_analisis()
